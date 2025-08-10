@@ -11,8 +11,9 @@ from datetime import datetime
 from typing import List, Optional
 
 import requests
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl, Field
 
 # Import helpers from our slideshow builder
@@ -46,6 +47,7 @@ class RenderRequest(BaseModel):
     auto_subs: bool = Field(False, description="Generate subtitles from audio using faster-whisper and burn them")
     subs_lang: str = Field("en", description="Subtitle language code, or 'auto' for auto-detect")
     whisper_model: str = Field("small", description="Whisper model size: tiny/base/small/medium/large-v3")
+    subs_url: Optional[HttpUrl] = Field(None, description="Optional URL to an existing SRT/ASS subtitles file to burn")
 
     # Optional explicit ffmpeg/ffprobe paths
     ffmpeg_bin: Optional[str] = None
@@ -60,6 +62,7 @@ def ensure_bin(path: Optional[str], default_name: str) -> str:
 
 env_jobs_dir = os.path.join(os.getcwd(), "jobs")
 os.makedirs(env_jobs_dir, exist_ok=True)
+app.mount("/jobs", StaticFiles(directory=env_jobs_dir), name="jobs")
 
 
 def _run_ffmpeg(cmd: List[str]) -> None:
@@ -82,7 +85,7 @@ def _download_to(path: str, url: str) -> None:
 
 
 @app.post("/render")
-def render(req: RenderRequest):
+def render(req: RenderRequest, request: Request):
     if len(req.image_urls) == 0:
         raise HTTPException(status_code=400, detail="image_urls cannot be empty")
 
@@ -130,7 +133,14 @@ def render(req: RenderRequest):
 
     # Optionally auto-generate subtitles
     subs_path: Optional[str] = None
-    if req.auto_subs:
+    if req.subs_url:
+        # Download provided subtitles file (expects .srt or .ass)
+        ext = os.path.splitext(str(req.subs_url))[-1].lower() or ".srt"
+        if ext not in (".srt", ".ass"):
+            ext = ".srt"
+        subs_path = os.path.join(captions_dir, f"external{ext}")
+        _download_to(subs_path, str(req.subs_url))
+    elif req.auto_subs:
         try:
             from faster_whisper import WhisperModel
         except Exception as exc:
@@ -186,12 +196,15 @@ def render(req: RenderRequest):
     except subprocess.CalledProcessError as exc:
         raise HTTPException(status_code=500, detail=f"Render failed (exit {exc.returncode}). Command: {' '.join(cmd)}")
 
-    # Return the video file
-    filename = f"render_{job_id}.mp4"
-    return FileResponse(
-        out_path,
-        media_type="video/mp4",
-        filename=filename,
-    )
+    # Build a public download URL served via StaticFiles
+    base_url = str(request.base_url).rstrip("/")
+    public_path = f"/jobs/{job_id}/out/video.mp4"
+    download_url = f"{base_url}{public_path}"
+
+    return JSONResponse({
+        "status": "ok",
+        "job_id": job_id,
+        "download_url": download_url
+    })
 
 

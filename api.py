@@ -48,6 +48,21 @@ class RenderRequest(BaseModel):
     subs_lang: str = Field("en", description="Subtitle language code, or 'auto' for auto-detect")
     whisper_model: str = Field("small", description="Whisper model size: tiny/base/small/medium/large-v3")
     subs_url: Optional[HttpUrl] = Field(None, description="Optional URL to an existing SRT/ASS subtitles file to burn")
+    subs_style: str = Field(
+        "srt",
+        description="When auto_subs is true, choose 'srt', 'ass_2word', or 'ass_3word_sync' (requires word_timestamps)",
+    )
+
+    # Presets
+    shorts_preset: bool = Field(False, description="Use 9:16 1080x1920 vertical output suitable for Shorts")
+
+    # Visual effects
+    kenburns: bool = Field(False, description="Enable gentle pan/zoom on still images")
+    kenburns_direction: str = Field(
+        "auto",
+        description="Ken Burns style: auto|zoom_in|zoom_out|pan_lr|pan_rl|pan_tb|pan_bt",
+    )
+    kenburns_strength: float = Field(1.1, description="Max zoom factor, e.g., 1.1 = 10%")
 
     # Optional explicit ffmpeg/ffprobe paths
     ffmpeg_bin: Optional[str] = None
@@ -146,15 +161,29 @@ def render(req: RenderRequest, request: Request):
         except Exception as exc:
             raise HTTPException(status_code=500, detail="Auto subtitles require faster-whisper. Install it on the server.")
         model = WhisperModel(req.whisper_model, device="cpu", compute_type="int8")
+        want_word_ts = getattr(req, "subs_style", "srt") == "ass_3word_sync"
         segments, _info = model.transcribe(
             audio_mp3,
             language=(None if req.subs_lang == "auto" else req.subs_lang),
             vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 300},
+            word_timestamps=want_word_ts,
         )
-        # Write SRT
-        subs_path = os.path.join(captions_dir, "auto.srt")
-        count = _write_srt_from_segments(list(segments), subs_path)
+        seg_list = list(segments)
+        style = getattr(req, "subs_style", "srt")
+        if style == "ass_2word":
+            # Write ASS two-word animated
+            from scripts.make_video import _write_ass_two_word_from_segments
+            subs_path = os.path.join(captions_dir, "auto_two_word.ass")
+            count = _write_ass_two_word_from_segments(seg_list, subs_path, req.w, req.h)
+        elif style == "ass_3word_sync":
+            from scripts.make_video import _write_ass_three_word_from_segments
+            subs_path = os.path.join(captions_dir, "auto_three_word.ass")
+            count = _write_ass_three_word_from_segments(seg_list, subs_path, req.w, req.h)
+        else:
+            # Write SRT
+            subs_path = os.path.join(captions_dir, "auto.srt")
+            count = _write_srt_from_segments(seg_list, subs_path)
         if count == 0:
             subs_path = None
 
@@ -170,6 +199,10 @@ def render(req: RenderRequest, request: Request):
         slide = max(0.05, desired_slide)
     if xfade >= slide:
         xfade = max(0.0, slide - 0.05)
+
+    # Shorts-friendly override
+    if req.shorts_preset and req.w == 1920 and req.h == 1080:
+        req.w, req.h = 1080, 1920
 
     # Build ffmpeg command and render
     out_path = os.path.join(out_dir, "video.mp4")
@@ -189,6 +222,9 @@ def render(req: RenderRequest, request: Request):
         fadein=req.fadein,
         fadeout=req.fadeout,
         ffmpeg_bin=ffmpeg_bin,
+        kenburns=req.kenburns,
+        kenburns_direction=req.kenburns_direction,
+        kenburns_strength=req.kenburns_strength,
     )
 
     try:

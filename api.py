@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import subprocess
 import tempfile
@@ -12,6 +13,7 @@ from typing import List, Optional
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
+from fastapi import Path as FastAPIPath
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl, Field
@@ -206,6 +208,34 @@ def render(req: RenderRequest, request: Request):
 
     # Build ffmpeg command and render
     out_path = os.path.join(out_dir, "video.mp4")
+    # Progress/meta files
+    progress_path = os.path.join(tmp_dir, "ffmpeg_progress.txt")
+    meta_path = os.path.join(tmp_dir, "meta.json")
+
+    # Compute expected total duration (in seconds) to estimate progress
+    # total = N*slide - (N-1)*xfade
+    try:
+        num_images = max(0, len(image_paths))
+        total_duration = max(0.0, num_images * float(slide) - max(0, num_images - 1) * float(xfade))
+    except Exception:
+        num_images = len(image_paths)
+        total_duration = 0.0
+
+    total_ms = int(round(total_duration * 1000.0))
+    # Write meta so status endpoint can compute %
+    try:
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "job_id": job_id,
+                "total_ms": total_ms,
+                "num_images": num_images,
+                "w": req.w,
+                "h": req.h,
+                "slide": slide,
+                "xfade": xfade,
+            }, f)
+    except Exception:
+        pass
     cmd = build_ffmpeg_command(
         image_paths=image_paths,
         audio_path=audio_mp3,
@@ -227,6 +257,10 @@ def render(req: RenderRequest, request: Request):
         kenburns_strength=req.kenburns_strength,
     )
 
+    # Instruct ffmpeg to write progress key=value updates to a file we can read
+    # We append here to avoid changing the builder signature
+    cmd = cmd[:-1] + ["-progress", progress_path, "-stats_period", "0.5"] + cmd[-1:]
+
     try:
         subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as exc:
@@ -236,11 +270,79 @@ def render(req: RenderRequest, request: Request):
     base_url = str(request.base_url).rstrip("/")
     public_path = f"/jobs/{job_id}/out/video.mp4"
     download_url = f"{base_url}{public_path}"
+    status_url = f"{base_url}/jobs/{job_id}/status"
 
     return JSONResponse({
         "status": "ok",
         "job_id": job_id,
-        "download_url": download_url
+        "download_url": download_url,
+        "status_url": status_url
     })
 
 
+
+@app.get("/jobs/{job_id}/status")
+def job_status(job_id: str = FastAPIPath(..., description="Job identifier returned by /render")):
+    job_root = os.path.join(env_jobs_dir, job_id)
+    if not os.path.isdir(job_root):
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    tmp_dir = os.path.join(job_root, "tmp")
+    out_dir = os.path.join(job_root, "out")
+    progress_path = os.path.join(tmp_dir, "ffmpeg_progress.txt")
+    meta_path = os.path.join(tmp_dir, "meta.json")
+    out_path = os.path.join(out_dir, "video.mp4")
+
+    total_ms = None
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+            total_ms = int(meta.get("total_ms", 0))
+    except Exception:
+        total_ms = 0
+
+    out_time_ms = 0
+    state = "queued"
+    progress_marker = None
+
+    if os.path.exists(progress_path):
+        try:
+            with open(progress_path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = [ln.strip() for ln in f if ln.strip()]
+            # Parse last block (ffmpeg writes repeated key=value blocks separated by blank lines)
+            latest: dict[str, str] = {}
+            for ln in lines:
+                if "=" in ln:
+                    k, v = ln.split("=", 1)
+                    latest[k] = v
+            out_time_ms = int(latest.get("out_time_ms", latest.get("out_time_us", "0")))
+            # out_time_us if present, convert to ms
+            if "out_time_us" in latest:
+                out_time_ms = int(int(latest.get("out_time_us", "0")) / 1000)
+            progress_marker = latest.get("progress")
+            state = "running" if progress_marker != "end" else "finalizing"
+        except Exception:
+            state = "running"
+
+    if os.path.exists(out_path):
+        state = "done"
+        # If finished and total unknown, derive using file existence
+        if total_ms == 0 and out_time_ms == 0:
+            out_time_ms = total_ms
+
+    percent = None
+    try:
+        if total_ms and total_ms > 0:
+            percent = max(0.0, min(100.0, (out_time_ms / total_ms) * 100.0))
+        else:
+            percent = None
+    except Exception:
+        percent = None
+
+    return JSONResponse({
+        "job_id": job_id,
+        "state": state,
+        "out_time_ms": out_time_ms,
+        "total_ms": total_ms,
+        "percent": percent,
+    })

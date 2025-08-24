@@ -259,7 +259,7 @@ def render(req: RenderRequest, request: Request):
 
     # Instruct ffmpeg to write progress key=value updates to a file we can read
     # We append here to avoid changing the builder signature
-    cmd = cmd[:-1] + ["-progress", progress_path, "-stats_period", "0.5"] + cmd[-1:]
+    cmd = cmd[:-1] + ["-progress", progress_path] + cmd[-1:]
 
     try:
         subprocess.run(cmd, check=True)
@@ -270,7 +270,7 @@ def render(req: RenderRequest, request: Request):
     base_url = str(request.base_url).rstrip("/")
     public_path = f"/jobs/{job_id}/out/video.mp4"
     download_url = f"{base_url}{public_path}"
-    status_url = f"{base_url}/jobs/{job_id}/status"
+    status_url = f"{base_url}/status/{job_id}"
 
     return JSONResponse({
         "status": "ok",
@@ -281,7 +281,7 @@ def render(req: RenderRequest, request: Request):
 
 
 
-@app.get("/jobs/{job_id}/status")
+@app.get("/status/{job_id}")
 def job_status(job_id: str = FastAPIPath(..., description="Job identifier returned by /render")):
     job_root = os.path.join(env_jobs_dir, job_id)
     if not os.path.isdir(job_root):
